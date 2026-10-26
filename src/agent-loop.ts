@@ -39,8 +39,13 @@ import type { SkillLoader } from "./skills.js";
 import type { ApprovalHandler } from "./tools/base.js";
 import { ToolRegistry } from "./tools/base.js";
 import { demoteLegacyConversationSummaries } from "./tools/compression.js";
+import {
+  ExecutionBudgetScope,
+  validateExecutionBudget,
+  type ExecutionBudget,
+} from "./runtime/execution-budget.js";
 
-export interface AgentLoopConfig {
+export interface AgentLoopConfig extends ExecutionBudget {
   compressionThreshold?: number;
   compressionThresholdTokens?: number;
   maxToolRounds?: number;
@@ -55,6 +60,7 @@ export interface RunTurnInput {
   tools?: readonly string[];
   signal?: AbortSignal;
   onEvent?: AgentLoopEventHandler;
+  budget?: ExecutionBudget;
 }
 
 export interface TurnExecutionResult {
@@ -87,6 +93,7 @@ interface RunMutationGate {
 
 export class AgentLoop {
   private readonly maxToolRounds: number;
+  private readonly executionBudget: ExecutionBudget;
   private readonly retry: RetryPolicy;
   private readonly modelRequestPlanner: ModelRequestPlanner;
   private readonly runRecovery = new RunRecovery();
@@ -108,6 +115,14 @@ export class AgentLoop {
   ) {
     this.modelRequestPlanner = new ModelRequestPlanner(dependencies.config);
     this.maxToolRounds = dependencies.config?.maxToolRounds ?? 16;
+    if (!Number.isSafeInteger(this.maxToolRounds) || this.maxToolRounds < 1) {
+      throw new RangeError("maxToolRounds must be a positive safe integer");
+    }
+    this.executionBudget = {
+      timeoutMs: dependencies.config?.timeoutMs,
+      maxToolCalls: dependencies.config?.maxToolCalls,
+    };
+    validateExecutionBudget(this.executionBudget);
     this.retry = new RetryPolicy(dependencies.config?.retry);
   }
 
@@ -190,10 +205,13 @@ export class AgentLoop {
 
   async runTurnDetailed(input: RunTurnInput): Promise<TurnExecutionResult> {
     const request = snapshotRunTurnInput(input);
-    return this.enqueueSession(request.sessionId, async () => {
-      const skills = await this.prepareSkillSelection(request.skills, request.signal);
-      this.consumePreparedSkillSelection(request, skills);
-      return this.runTurnSerialized(request, skills);
+    return this.withExecutionBudget(request.budget, request.signal, async (budget) => {
+      request.signal = budget.signal;
+      return this.enqueueSession(request.sessionId, async () => {
+        const skills = await this.prepareSkillSelection(request.skills, request.signal);
+        this.consumePreparedSkillSelection(request, skills);
+        return this.runTurnSerialized(request, skills, budget);
+      });
     });
   }
 
@@ -224,22 +242,40 @@ export class AgentLoop {
   /** Reserve FIFO order before Runtime resolves Session ownership and capabilities. @internal */
   runTurnDetailedDeferred(
     sessionId: string,
-    prepare: () => Promise<PreparedRuntimeTurn>,
+    prepare: (signal?: AbortSignal) => Promise<PreparedRuntimeTurn>,
+    options: { signal?: AbortSignal; budget?: ExecutionBudget } = {},
   ): Promise<TurnExecutionResult> {
-    return this.enqueueSession(sessionId, async () => {
-      const prepared = await prepare();
-      const request = snapshotRunTurnInput(prepared.input);
-      if (request.sessionId !== sessionId) {
-        throw new Error("Prepared Runtime Turn changed its reserved Session ID");
-      }
-      this.consumePreparedSkillSelection(request, prepared.skills);
-      return this.runTurnSerialized(request, prepared.skills);
-    });
+    return this.withExecutionBudget(options.budget, options.signal, (budget) =>
+      this.enqueueSession(sessionId, async () => {
+        throwIfAborted(budget.signal);
+        const prepared = await prepare(budget.signal);
+        const request = snapshotRunTurnInput(prepared.input);
+        request.signal = budget.signal;
+        if (request.sessionId !== sessionId) {
+          throw new Error("Prepared Runtime Turn changed its reserved Session ID");
+        }
+        this.consumePreparedSkillSelection(request, prepared.skills);
+        return this.runTurnSerialized(request, prepared.skills, budget);
+      }));
+  }
+
+  private async withExecutionBudget<Result>(
+    requested: ExecutionBudget | undefined,
+    signal: AbortSignal | undefined,
+    operation: (scope: ExecutionBudgetScope) => Promise<Result>,
+  ): Promise<Result> {
+    const scope = new ExecutionBudgetScope(this.executionBudget, requested, signal);
+    try {
+      return await operation(scope);
+    } finally {
+      scope.dispose();
+    }
   }
 
   private async runTurnSerialized(
     input: RunTurnInput,
     skills: PreparedSkillSelection,
+    budget: ExecutionBudgetScope,
   ): Promise<TurnExecutionResult> {
     // A request cancelled before admission (including while waiting in the
     // per-session FIFO) must not create a Run or append a user message.
@@ -251,7 +287,9 @@ export class AgentLoop {
       : this.dependencies.tools.snapshot();
     const systemPrompt = this.buildSystemPrompt(input, skills.instructions);
     await this.recoverSessionSerialized(input.sessionId);
+    throwIfAborted(input.signal);
     const session = await this.dependencies.sessionStore.getOrCreate(input.sessionId);
+    throwIfAborted(input.signal);
     const rewroteLegacySummaries = demoteLegacyConversationSummaries(session.messages);
     const runState = createRunState();
     session.runState = runState;
@@ -292,6 +330,7 @@ export class AgentLoop {
           activeTools,
           toolContext,
           systemPrompt,
+          budget,
           input.signal,
         );
         runState.round = round;
@@ -326,6 +365,9 @@ export class AgentLoop {
         const calls = normalizeToolCalls(response.toolCalls);
         const content = normalizeModelContent(response.content);
         assertUniqueToolCallIds(calls, runState);
+        // Reject the entire batch before persisting assistant tool-call messages.
+        // This avoids orphaned calls and partially executing an over-budget batch.
+        budget.reserveToolCalls(calls.length);
         session.messages.push(
           createMessage({
             role: "assistant",
@@ -442,6 +484,7 @@ export class AgentLoop {
       signal?: AbortSignal;
     },
     systemPrompt: string,
+    budgetScope: ExecutionBudgetScope,
     signal?: AbortSignal,
   ): Promise<ModelRequest> {
     let request = this.createModelRequestSnapshot(session, activeTools, systemPrompt, signal);
@@ -467,6 +510,7 @@ export class AgentLoop {
       if (decision.kind === "ready") return decision.request;
       if (decision.kind === "reject") throw decision.error;
 
+      budgetScope.reserveToolCalls(1);
       const compressed = await this.compressConversation(activeTools, toolContext);
       compressionPasses += 1;
       throwIfAborted(signal);
@@ -649,6 +693,7 @@ function snapshotRunTurnInput(input: RunTurnInput): RunTurnInput {
     tools: input.tools ? [...input.tools] : undefined,
     signal: input.signal,
     onEvent: input.onEvent,
+    budget: input.budget ? { ...input.budget } : undefined,
   };
 }
 

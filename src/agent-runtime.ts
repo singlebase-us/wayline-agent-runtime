@@ -15,7 +15,8 @@ import {
   type SessionStore,
 } from "./session.js";
 import type { SkillCatalog, SkillDescriptor, SkillLoader } from "./skills.js";
-import type { ToolDescriptor, ToolRegistry } from "./tools/base.js";
+import type { RegisterToolOptions, Tool, ToolDescriptor, ToolRegistry } from "./tools/base.js";
+import type { ExecutionBudget } from "./runtime/execution-budget.js";
 
 export interface TextContentPart {
   type: "text";
@@ -80,6 +81,8 @@ export interface PromptInput {
   expectedBinding?: SessionBinding;
   signal?: AbortSignal;
   onEvent?: AgentLoopEventHandler;
+  /** Optional tighter limits for this request; cannot raise configured Loop limits. */
+  budget?: ExecutionBudget;
 }
 
 export interface TurnResult {
@@ -232,6 +235,17 @@ export class AgentRuntime {
       tools: structuredClone(this.dependencies.tools.descriptors()),
       skills: structuredClone(await this.dependencies.skills?.list() ?? []),
     };
+  }
+
+  /** Host-level registration. Changes become visible to subsequent Turns. */
+  registerTool(tool: Tool, options: RegisterToolOptions = {}): void {
+    this.assertAvailable();
+    this.dependencies.tools.register(tool, options);
+  }
+
+  unregisterTool(name: string): boolean {
+    this.assertAvailable();
+    return this.dependencies.tools.unregister(name);
   }
 
   async createSession(input: CreateSessionInput = {}): Promise<SessionInfo> {
@@ -419,13 +433,20 @@ export class AgentRuntime {
     runs.add(active);
     this.active.set(request.sessionId, runs);
 
+    let detachBudgetSignal = (): void => undefined;
     try {
       // Reserve the canonical per-Session FIFO slot before any asynchronous
       // Store or Skill work, so a slower first request cannot be overtaken by
       // a later request or lose the createIfMissing capability-scope race.
       const result = await this.dependencies.loop.runTurnDetailedDeferred(
         request.sessionId,
-        async () => {
+        async (signal) => {
+          if (signal) {
+            const abort = () => controller.abort(signal.reason);
+            if (signal.aborted) abort();
+            else signal.addEventListener("abort", abort, { once: true });
+            detachBudgetSignal = () => signal.removeEventListener("abort", abort);
+          }
           throwIfAborted(controller.signal);
           const resolved = await this.resolvePromptSession(request, controller.signal);
           const session = resolved.session;
@@ -471,6 +492,7 @@ export class AgentRuntime {
             skills: preparedSkills,
           };
         },
+        { signal: controller.signal, budget: request.budget },
       );
       return {
         sessionId: result.sessionId,
@@ -479,6 +501,7 @@ export class AgentRuntime {
         content: [{ type: "text", text: result.content }],
       };
     } finally {
+      detachBudgetSignal();
       active.detachSignal?.();
       runs.delete(active);
       if (runs.size === 0) this.active.delete(request.sessionId);
@@ -900,6 +923,7 @@ function snapshotPromptInput(input: PromptInput): PromptInput {
     expectedBinding: snapshotSessionBinding(input.expectedBinding),
     signal: input.signal,
     onEvent: input.onEvent,
+    budget: input.budget ? { ...input.budget } : undefined,
   };
 }
 

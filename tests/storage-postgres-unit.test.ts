@@ -187,3 +187,31 @@ function result(rows: unknown[] = [], rowCount = rows.length): {
 } {
   return { rows, rowCount };
 }
+
+test("PostgreSQL loads already-decoded JSONB scalar tool results without reparsing", async () => {
+  const { types } = await import("pg");
+  for (const value of ["hello", "123", "null", '{"nested":true}', "", null, 42, false, { answer: 42 }]) {
+    const decoded = types.getTypeParser(3802)(JSON.stringify(value));
+    const client = {
+      release() {},
+      async query(sql: string) {
+        if (sql.includes("FROM agent_runtime.sessions")) return result([
+          { id: "s", version: 1, metadata_json: {}, ownership_json: null, current_run_id: "r" },
+        ]);
+        if (sql.includes("FROM agent_runtime.runs")) return result([
+          { id: "r", status: "completed", phase: "idle", round: 0, started_at: "now", updated_at: "now" },
+        ]);
+        if (sql.includes("FROM agent_runtime.tool_calls")) return result([
+          { id: "c", name: "tool", arguments_json: {}, status: "completed", result_json: decoded, result_missing: false },
+        ]);
+        return result();
+      },
+    };
+    const pool = Object.assign(new EventEmitter(), {
+      async connect() { return client; }, async end() {},
+    }) as unknown as Pool;
+    const store = new PostgresSessionStore({ connectionString: "postgresql://localhost/test", namespace: "test", pool });
+    try { assert.deepEqual((await store.get("s"))?.runState?.toolCalls[0]?.result, value); }
+    finally { await store.close(); }
+  }
+});

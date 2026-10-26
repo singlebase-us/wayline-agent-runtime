@@ -24,6 +24,7 @@ import {
 } from "../agent-runtime.js";
 import { AcpPermissionBridge } from "./permission.js";
 import { AcpUpdateProjector } from "./projector.js";
+import { ExecutionBudgetExceededError } from "../runtime/execution-budget.js";
 
 const ACP_BINDING_KIND = "acp.workspace";
 const LEGACY_ACP_CWD_METADATA = "acp.cwd";
@@ -244,7 +245,9 @@ export function createAcpAgent(
         // Runtime.close() aborts its internal controller, while ACP permission
         // requests use this outer scope. Close it before draining updates so a
         // pending permission RPC or notification cannot survive the prompt.
-        if (isAbortError(error) && !controller.signal.aborted) {
+        if ((isAbortError(error)
+          || error instanceof ExecutionBudgetExceededError && error.budget === "timeoutMs")
+          && !controller.signal.aborted) {
           controller.abort(error);
         }
         try {
@@ -522,6 +525,9 @@ function forwardAbort(source: AbortSignal, target: AbortController): () => void 
 }
 
 function toRequestError(error: unknown, sessionId?: string): RequestError {
+  if (error instanceof ExecutionBudgetExceededError) {
+    return RequestError.invalidRequest({ budget: error.budget, limit: error.limit }, error.message);
+  }
   if (error instanceof RequestError) return error;
   if (isAbortError(error)) return RequestError.requestCancelled();
   if (error instanceof SessionNotFoundError) {

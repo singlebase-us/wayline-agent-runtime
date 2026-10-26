@@ -1,5 +1,7 @@
 export * from "./agent-loop.js";
 export * from "./agent-runtime.js";
+export * from "./create-runtime.js";
+export { ExecutionBudgetExceededError, type ExecutionBudget } from "./runtime/execution-budget.js";
 export * from "./model.js";
 export * from "./prompt.js";
 export * from "./session.js";

@@ -36,6 +36,11 @@ export interface ToolDescriptor extends ToolDefinition {
   executionPolicy: "parallel" | "exclusive";
 }
 
+export interface RegisterToolOptions {
+  /** Explicitly replace a same-named tool. Existing Turn snapshots are unchanged. */
+  replace?: boolean;
+}
+
 export class ToolRegistry {
   private readonly tools = new Map<string, Tool>();
   private readonly validators = new Map<string, ValidateFunction>();
@@ -48,8 +53,10 @@ export class ToolRegistry {
     errorsText(errors?: ValidateFunction["errors"], options?: { separator: string }): string;
   };
 
-  register(tool: Tool): void {
-    if (this.tools.has(tool.name)) throw new Error(`Tool already registered: ${tool.name}`);
+  register(tool: Tool, options: RegisterToolOptions = {}): void {
+    if (this.tools.has(tool.name) && !options.replace) {
+      throw new Error(`Tool already registered: ${tool.name}`);
+    }
     const registered = snapshotTool(tool);
     const validator = this.compiler().compile(registered.inputSchema);
     this.tools.set(registered.name, registered);

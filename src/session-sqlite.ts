@@ -306,7 +306,10 @@ export class SqliteSessionStore implements SessionStore {
     if (!sessionColumns.some((column) => column.name === "current_run_id")) {
       this.database.exec("ALTER TABLE sessions ADD COLUMN current_run_id TEXT");
     }
-    this.database.exec(`
+    const hasCurrentRunMigration = this.database.prepare(
+      "SELECT version FROM schema_migrations WHERE version = 2",
+    ).get();
+    if (!hasCurrentRunMigration) this.database.exec(`
       UPDATE sessions
       SET current_run_id = (
         SELECT id FROM runs

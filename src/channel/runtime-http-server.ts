@@ -11,6 +11,7 @@ import {
 } from "../agent-runtime.js";
 import type { AgentLoopEvent } from "../runtime/events.js";
 import { assertValidSessionId } from "../session.js";
+import { ExecutionBudgetExceededError } from "../runtime/execution-budget.js";
 
 export interface RuntimeServerOptions {
   host?: string;
@@ -329,6 +330,13 @@ interface HttpFailure {
 }
 
 function toHttpFailure(error: unknown): HttpFailure {
+  if (error instanceof ExecutionBudgetExceededError) {
+    return {
+      status: error.budget === "timeoutMs" ? 408 : 422,
+      code: error.code,
+      message: error.message,
+    };
+  }
   if (error instanceof HttpRequestError) {
     return { status: error.status, code: error.code, message: error.message };
   }

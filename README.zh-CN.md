@@ -50,24 +50,16 @@ npm run example
 示例中的包名通过仓库自身的 package exports 解析。
 
 ```js
-import {
-  AgentLoop,
-  AgentRuntime,
-  InMemorySessionStore,
-  ToolRegistry,
-} from "wayline-agent-runtime";
+import { createRuntime } from "wayline-agent-runtime";
 
-const runtime = new AgentRuntime({
-  loop: new AgentLoop({
-    model: {
-      async complete({ messages }) {
-        return { content: `收到：${messages.at(-1)?.content ?? ""}` };
-      },
+const runtime = createRuntime({
+  model: {
+    async complete({ messages }) {
+      return { content: `收到：${messages.at(-1)?.content ?? ""}` };
     },
-    tools: new ToolRegistry(),
-    sessionStore: new InMemorySessionStore(),
-    requestApproval: async () => false,
-  }),
+  },
+  workspaceRoot: process.cwd(),
+  requestApproval: async () => false,
 });
 
 try {
@@ -84,6 +76,70 @@ try {
 
 如果要在另一个本地项目中使用，先在本仓库执行 `npm pack`，再到目标项目安装生成的 tarball。
 以上步骤直接使用仓库构建产物，不依赖已发布的 npm 包。
+
+### 内置与自定义工具
+
+推荐使用 `createRuntime()`：默认注册 `bash` 和 `compress_conversation`，默认使用内存存储。
+Bash 启用时必须提供 `workspaceRoot`，每条命令都需要 `requestApproval` 批准；未提供审批处理器时默认拒绝。
+工作目录限制不是 Shell 沙箱。压缩默认复用主模型，也可以通过 `summarizer` 指定独立模型。
+
+```ts
+import { createRuntime, type Tool } from "wayline-agent-runtime";
+
+const lookup: Tool = {
+  name: "lookup",
+  description: "Look up a value",
+  inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  async execute(_arguments, { signal }) {
+    signal?.throwIfAborted();
+    return { value: 42 };
+  },
+};
+
+const runtime = createRuntime({
+  model, summarizer, workspaceRoot, sessionStore, requestApproval,
+  tools: [lookup],
+  config: { maxToolRounds: 16, maxToolCalls: 64, timeoutMs: 300_000 },
+});
+```
+
+上例中的模型、目录、存储和审批处理器由宿主提供。
+通过 `builtins: { bash: false, compression: false }` 可以关闭内置工具。
+`tools` 中出现同名工具会报错；构造时可用 `replaceTools: [replacement]` 显式替换已注册工具。
+创建后可调用 `runtime.registerTool(tool)`、`runtime.registerTool(tool, { replace: true })`
+和 `runtime.unregisterTool(name)`。变更只影响后续请求；当前请求使用固定的工具快照。
+会话和请求的工具列表只能在宿主授予的能力范围内选择。这里提供的是 SDK 接口，没有远程注册工具的 HTTP API。
+
+工具执行默认允许并发。涉及外部副作用且需要顺序执行的工具应声明 `executionPolicy: "exclusive"`；
+只有可信的会话修改工具才应声明 `sessionAccess: "write"`。工具应传递并响应 `context.signal`。
+
+### 执行预算与资源关闭
+
+`createRuntime()` 默认每次请求最多 **16 轮模型执行、64 次工具调用、5 分钟**。
+可通过 `config` 调整；直接构造 `AgentLoop` 保留原有默认值：16 轮，工具调用数和总超时不设默认限制。
+一轮可能调用多个工具，最后的纯文本回复也占一轮；模型重试不额外占轮数。
+工具调用预算跨轮累计，包含失败的工具调用和自动压缩尝试，每次请求重新计数。
+超限工具批次会在任何一个调用执行之前整体拒绝，不会留下未配对的工具调用消息。
+
+单次请求可以设置更严格的预算，不能放宽 Loop 配置的上限：
+
+```ts
+await runtime.prompt({
+  sessionId: "demo",
+  content: [{ type: "text", text: "执行任务" }],
+  budget: { timeoutMs: 30_000, maxToolCalls: 8 },
+});
+```
+
+`maxToolCalls: 0` 禁止工具调用。超时从请求进入 Loop 时开始，包含排队、能力加载、审批与执行。
+超时使用协作式取消：停止后续调用、向模型和工具传播 `AbortSignal`，等待已启动工作结束后返回。
+排队请求超时后不会开始执行，但仍需等待前序工作释放 FIFO；忽略信号的实现可能延迟返回和关闭。
+执行预算错误为 `ExecutionBudgetExceededError`，包含 `budget`、`limit` 和 `code: "EXECUTION_BUDGET_EXCEEDED"`。
+超时运行记为取消，工具次数超限记为失败；达到轮数上限仍沿用原有失败行为，不自动追加总结。
+
+`runtime.close()` 取消并等待运行，不会关闭宿主传入的 Store、模型、工具或 MCP 连接。
+关闭顺序是先 `await runtime.close()`，再由宿主关闭数据库及其他连接。
+`AgentLoop` / `AgentRuntime` 的手动装配接口仍可用于高级接入。
 
 ### 接入真实模型
 

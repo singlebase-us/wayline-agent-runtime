@@ -7,6 +7,8 @@ test("the package root exposes core APIs without adapter or internal policy barr
 
   assert.equal(typeof core.AgentLoop, "function");
   assert.equal(typeof core.AgentRuntime, "function");
+  assert.equal(typeof core.createRuntime, "function");
+  assert.equal(typeof core.ExecutionBudgetExceededError, "function");
   assert.equal(typeof core.ToolRegistry, "function");
   for (const excluded of [
     "AcpPermissionBridge",

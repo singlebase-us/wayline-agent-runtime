@@ -57,24 +57,16 @@ After `npm run build`, save this as `demo.mjs` in the repository root and run `n
 The package name below resolves through the repository's own package exports.
 
 ```js
-import {
-  AgentLoop,
-  AgentRuntime,
-  InMemorySessionStore,
-  ToolRegistry,
-} from "wayline-agent-runtime";
+import { createRuntime } from "wayline-agent-runtime";
 
-const runtime = new AgentRuntime({
-  loop: new AgentLoop({
-    model: {
-      async complete({ messages }) {
-        return { content: `Echo: ${messages.at(-1)?.content ?? ""}` };
-      },
+const runtime = createRuntime({
+  model: {
+    async complete({ messages }) {
+      return { content: `Echo: ${messages.at(-1)?.content ?? ""}` };
     },
-    tools: new ToolRegistry(),
-    sessionStore: new InMemorySessionStore(),
-    requestApproval: async () => false,
-  }),
+  },
+  workspaceRoot: process.cwd(),
+  requestApproval: async () => false,
 });
 
 try {
@@ -91,6 +83,77 @@ try {
 
 For another local project, run `npm pack` in this checkout, then install the generated tarball in that
 project. These instructions use the repository build and do not depend on a published npm release.
+
+### Built-in and custom tools
+
+`createRuntime()` is the recommended entry point. It registers `bash` and `compress_conversation`
+and defaults to an in-memory store. Enabling Bash requires `workspaceRoot`; every command requires
+host approval through `requestApproval`, which defaults to denial. A working directory is not a shell
+sandbox. Compression uses the main model unless you supply a separate `summarizer`.
+
+```ts
+import { createRuntime, type Tool } from "wayline-agent-runtime";
+
+const lookup: Tool = {
+  name: "lookup",
+  description: "Look up a value",
+  inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  async execute(_arguments, { signal }) {
+    signal?.throwIfAborted();
+    return { value: 42 };
+  },
+};
+
+const runtime = createRuntime({
+  model, summarizer, workspaceRoot, sessionStore, requestApproval,
+  tools: [lookup],
+  config: { maxToolRounds: 16, maxToolCalls: 64, timeoutMs: 300_000 },
+});
+```
+
+The host supplies the model, directory, store, and approval handler in this example.
+Disable built-ins with `builtins: { bash: false, compression: false }`.
+Duplicate names in `tools` fail. Use `replaceTools: [replacement]` to explicitly replace an existing
+registration during construction. After construction, use `runtime.registerTool(tool)`,
+`runtime.registerTool(tool, { replace: true })`, or `runtime.unregisterTool(name)`.
+Changes affect subsequent Turns only; active Turns retain their snapshots. Session and request tool
+selections stay within host-granted capabilities. These are SDK APIs, not an HTTP tool registration endpoint.
+
+Tools default to parallel execution. Declare `executionPolicy: "exclusive"` for external effects that
+must remain ordered. Reserve `sessionAccess: "write"` for trusted Session writers. Forward and observe
+`context.signal` in tool implementations.
+
+### Execution budgets and shutdown
+
+`createRuntime()` defaults to **16 model rounds, 64 tool calls, and 5 minutes per request**.
+Adjust these through `config`. Manual `AgentLoop` construction retains its original defaults: 16 rounds,
+with no default tool-count or total timeout limit. One round may contain several tools; the final text
+response also consumes a round. Model retries do not consume additional rounds.
+Tool calls accumulate across rounds, including failed calls and automatic compression attempts, and reset
+for each request. A batch exceeding the remaining allowance is rejected before any of its tools execute
+or unpaired assistant tool-call messages are persisted.
+
+Requests can impose tighter budgets, but cannot raise configured Loop limits:
+
+```ts
+await runtime.prompt({
+  sessionId: "demo",
+  content: [{ type: "text", text: "Run the task" }],
+  budget: { timeoutMs: 30_000, maxToolCalls: 8 },
+});
+```
+
+`maxToolCalls: 0` disables tool calls. The deadline starts when the request enters the Loop and includes
+FIFO waiting, capability loading, approvals, and execution. Cancellation is cooperative: stop dispatch,
+propagate `AbortSignal`, and join started work before returning. Expired queued requests do not execute,
+but wait for preceding work to release the FIFO. Implementations ignoring the signal can delay return
+and shutdown. Budget errors are `ExecutionBudgetExceededError` with `budget`, `limit`, and
+`code: "EXECUTION_BUDGET_EXCEEDED"`. Deadline expiry cancels a Run; tool-count exhaustion fails it.
+The round limit retains its existing failure behavior without an automatic final summary.
+
+`runtime.close()` cancels and joins work. It never closes injected stores, models, tools, or MCP connections.
+Close the Runtime first, then close those host-owned resources. Manual `AgentLoop` / `AgentRuntime`
+composition remains available for advanced integrations.
 
 ### Run with a real model
 

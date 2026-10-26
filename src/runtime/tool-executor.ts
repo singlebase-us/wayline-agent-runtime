@@ -233,6 +233,9 @@ export class CoordinatedToolExecutor {
 
     let outcome: ToolOutcome;
     try {
+      // Cancellation may arrive while the running checkpoint is being saved,
+      // or synchronously from the started observer, before execution begins.
+      throwIfAborted(context.signal);
       const tool = this.tools.get(call.name);
       const argumentsSnapshot = structuredClone(call.arguments);
       this.tools.validate(call.name, argumentsSnapshot);

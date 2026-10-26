@@ -280,3 +280,29 @@ The package root is the protocol-neutral core. ACP, Channel, provider, storage, 
 legacy compatibility APIs are exposed only through explicit package subpaths. This keeps importing the
 core from eagerly evaluating optional adapter dependency graphs and prevents internal Runtime policy
 objects from becoming accidental compatibility commitments.
+
+## Runtime construction and execution budgets
+
+`createRuntime()` is the recommended composition root. It creates a `ToolRegistry`, registers Bash and
+conversation compression by default, applies host tool additions and explicit replacements, then constructs
+the existing `AgentLoop` and `AgentRuntime`. It introduces no alternate execution path. Bash requires an
+explicit workspace directory and host approval; either built-in can be disabled. A missing summarizer uses
+the primary model. Injected Store, model, and MCP resources remain host-owned; close the Runtime before them.
+
+Host-level `AgentRuntime.registerTool` / `unregisterTool` operations use the Loop's canonical registry.
+Replacement is explicit and validates the new schema before changing the registry. Immutable per-Turn
+snapshots preserve existing execution; session and request capability selection cannot widen stored scope.
+
+`AgentLoop` owns a request-local `ExecutionBudgetScope` covering FIFO waiting, admission, model execution,
+automatic compression, and tool batches. Request overrides may tighten configured timeout and tool-count
+ceilings. Automatic compression attempts consume the same allowance as model-requested tools. Model batches
+are admitted atomically against the remaining tool-call count before assistant call messages are appended.
+No over-budget partial batch is executed. Limits reset per request, not per session.
+
+The factory defaults to 16 rounds, 64 tools, and 300,000 ms. Manual Loop construction preserves its existing
+16-round default and leaves the other limits unspecified. Deadlines abort cooperatively; they never detach
+started providers/tools or allow a following Turn to overtake work still capable of mutating external state.
+Queued expiry is observed before admission when the FIFO becomes available. Timers are disposed on every
+settlement. Deadline expiry finalizes an admitted Run as cancelled; tool-count exhaustion finalizes it as
+failed. Budget errors are typed and projected as safe HTTP/ACP errors, while ACP deadline cancellation uses
+the normal cancelled stop reason. Shell/MCP approval and Store ownership semantics are unchanged.

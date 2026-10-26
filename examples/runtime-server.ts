@@ -1,9 +1,5 @@
 import { resolve } from "node:path";
-import {
-  AgentLoop,
-  AgentRuntime,
-  ToolRegistry,
-} from "../src/index.js";
+import { createRuntime } from "../src/index.js";
 import { createAgentRuntimeHttpServer } from "../src/channel/index.js";
 import { createAiSdkOpenRouterClient } from "../src/provider/index.js";
 import {
@@ -12,7 +8,6 @@ import {
   type PostgresSchemaMode,
   type SessionDatabaseConfig,
 } from "../src/storage/index.js";
-import { ConversationCompressionTool } from "../src/tools/index.js";
 
 const apiKey = process.env.OPENROUTER_API_KEY ?? "";
 if (!apiKey) throw new Error("OPENROUTER_API_KEY is required");
@@ -24,8 +19,6 @@ const summarizer = createAiSdkOpenRouterClient({
   apiKey,
   model: process.env.OPENROUTER_SUMMARY_MODEL ?? "openai/gpt-4.1-mini",
 });
-const tools = new ToolRegistry();
-tools.register(new ConversationCompressionTool(summarizer));
 
 const schemaMode = process.env.AGENT_DATABASE_SCHEMA_MODE as PostgresSchemaMode | undefined;
 const postgresUrl = process.env.AGENT_POSTGRES_URL;
@@ -59,8 +52,12 @@ const databaseConfig: SessionDatabaseConfig = {
 };
 console.log("Session database:", resolveSessionDatabaseConfig(databaseConfig));
 const sessionStore = await openSessionStore(databaseConfig);
-const loop = new AgentLoop({ model, tools, sessionStore, requestApproval: async () => false });
-const agentRuntime = new AgentRuntime({ loop });
+const agentRuntime = createRuntime({
+  model,
+  summarizer,
+  sessionStore,
+  builtins: { bash: false },
+});
 const server = createAgentRuntimeHttpServer(agentRuntime, {
   host: process.env.AGENT_RUNTIME_HOST,
   port: Number(process.env.AGENT_RUNTIME_PORT ?? 8787),

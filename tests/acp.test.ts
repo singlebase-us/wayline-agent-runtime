@@ -17,6 +17,7 @@ import {
 import {
   AgentLoop,
   AgentRuntime,
+  createRuntime as createDefaultRuntime,
   InMemorySessionStore,
   ToolRegistry,
   type ApprovalHandler,
@@ -1280,3 +1281,43 @@ function gatedSessionUpdateStreams(): {
     releaseDelivery,
   };
 }
+
+test("ACP reports tool budget exhaustion and maps deadlines to cancellation", async () => {
+  for (const budget of ["maxToolCalls", "timeoutMs"] as const) {
+    const runtime = createDefaultRuntime({
+      builtins: { bash: false, compression: false },
+      config: budget === "timeoutMs" ? { timeoutMs: 10 } : { maxToolCalls: 0 },
+      model: { async complete({ signal }) {
+        if (budget === "timeoutMs") {
+          return new Promise((_resolve, reject) => {
+            if (signal?.aborted) reject(signal.reason);
+            else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+        }
+        return { toolCalls: [{ id: "call", name: "unavailable", arguments: {} }] };
+      } },
+    });
+    try {
+      // Keep the test process alive while the cooperative deadline is unref'ed.
+      const keepAlive = setInterval(() => undefined, 1_000);
+      try {
+        await client({ name: "budget-test" }).connectWith(createTestAcpAgent(runtime), async (context) => {
+          await initialize(context);
+          const session = await context.request(methods.agent.session.new, { cwd: process.cwd(), mcpServers: [] });
+          const pending = context.request(methods.agent.session.prompt, {
+            sessionId: session.sessionId, prompt: [{ type: "text", text: "go" }],
+          });
+          if (budget === "maxToolCalls") {
+            await assert.rejects(pending, (error: unknown) => {
+              assert.ok(error instanceof RequestError);
+              assert.match(error.message, /maxToolCalls=0/);
+              return true;
+            });
+          } else {
+            assert.equal((await pending).stopReason, "cancelled");
+          }
+        });
+      } finally { clearInterval(keepAlive); }
+    } finally { await runtime.close(); }
+  }
+});

@@ -594,7 +594,8 @@ function serializeJson(value: unknown): string {
 }
 
 function parseJson<Value = unknown>(value: unknown): Value {
-  if (typeof value === "string") return JSON.parse(value) as Value;
+  // pg already decodes json/jsonb, including scalar strings. Parsing a string
+  // again either corrupts its type or makes an otherwise valid Session unreadable.
   return structuredClone(value) as Value;
 }
 

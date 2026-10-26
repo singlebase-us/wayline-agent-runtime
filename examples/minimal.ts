@@ -1,9 +1,6 @@
 import {
-  AgentLoop,
-  AgentRuntime,
-  InMemorySessionStore,
+  createRuntime,
   type ModelClient,
-  ToolRegistry,
 } from "../src/index.js";
 
 const model: ModelClient = {
@@ -12,20 +9,18 @@ const model: ModelClient = {
   },
 };
 
-const tools = new ToolRegistry();
-const sessionStore = new InMemorySessionStore();
-
-const loop = new AgentLoop({
+const runtime = createRuntime({
   model,
-  tools,
-  sessionStore,
+  workspaceRoot: process.cwd(),
   requestApproval: async () => false,
 });
-const runtime = new AgentRuntime({ loop });
-
-await runtime.createSession({ sessionId: "demo" });
-const result = await runtime.prompt({
-  sessionId: "demo",
-  content: [{ type: "text", text: "你好" }],
-});
-console.log(result.content.map((part) => part.text).join(""));
+try {
+  await runtime.createSession({ sessionId: "demo" });
+  const result = await runtime.prompt({
+    sessionId: "demo",
+    content: [{ type: "text", text: "你好" }],
+  });
+  console.log(result.content.map((part) => part.text).join(""));
+} finally {
+  await runtime.close();
+}

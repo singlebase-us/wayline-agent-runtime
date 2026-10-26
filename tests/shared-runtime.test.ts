@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   AgentLoop,
   AgentRuntime,
+  createRuntime,
   InMemorySessionStore,
   RuntimeError,
   ToolRegistry,
@@ -439,5 +440,35 @@ test("HTTP progress buffering is bounded and cancels an overflowing turn", async
     assert.equal(modelCalls, 0);
   } finally {
     await server.close();
+  }
+});
+
+test("HTTP projects tool-count and timeout budget errors with safe actionable details", async () => {
+  for (const budget of ["maxToolCalls", "timeoutMs"] as const) {
+    const runtime = createRuntime({
+      builtins: { bash: false, compression: false },
+      config: budget === "timeoutMs" ? { timeoutMs: 10 } : { maxToolCalls: 0 },
+      model: { async complete({ signal }) {
+        if (budget === "timeoutMs") {
+          return new Promise((_resolve, reject) => {
+            if (signal?.aborted) reject(signal.reason);
+            else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+        }
+        return { toolCalls: [{ id: "call", name: "unavailable", arguments: {} }] };
+      } },
+    });
+    const server = createAgentRuntimeHttpServer(runtime, { port: 0 });
+    const address = await server.listen();
+    try {
+      const items = [];
+      for await (const item of streamRuntimeTurn(`http://${address.host}:${address.port}`, {
+        sessionId: "budget", userInput: "go",
+      })) items.push(item);
+      const error = items.find((item) => item.type === "error");
+      assert.equal(error?.code, "EXECUTION_BUDGET_EXCEEDED");
+      assert.match(error?.message ?? "", new RegExp(budget));
+      assert.equal(items.some((item) => item.type === "result"), false);
+    } finally { await server.close(); await runtime.close(); }
   }
 });

@@ -424,3 +424,23 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
   }
   throw new Error("condition not reached");
 }
+
+test("SQLite does not backfill a deliberately cleared current run on reopen", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "wayline-cleared-run-"));
+  const filename = join(directory, "sessions.sqlite");
+  let store = new SqliteSessionStore(filename);
+  try {
+    const session = await store.create("s");
+    session.runState = {
+      id: "r", status: "running", phase: "model", round: 0,
+      startedAt: "now", updatedAt: "now", toolCalls: [],
+    };
+    await store.save(session);
+    delete session.runState;
+    await store.save(session);
+    assert.equal((await store.get("s"))?.runState, undefined);
+    store.close();
+    store = new SqliteSessionStore(filename);
+    assert.equal((await store.get("s"))?.runState, undefined);
+  } finally { store.close(); await rm(directory, { recursive: true, force: true }); }
+});

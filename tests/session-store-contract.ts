@@ -17,6 +17,20 @@ export interface SessionStoreContractAdapter {
 }
 
 export function defineSessionStoreContract(adapter: SessionStoreContractAdapter): void {
+  test(`${adapter.name} SessionStore: preserves scalar tool result types across reopen`, async () => {
+    await withFixture(adapter, async (fixture) => {
+      const values = ["hello", "123", "null", '{"nested":true}', "", null, 42, false];
+      const session = await fixture.store.create("scalar-results");
+      session.runState = runState("scalar-run", "completed", "2026-10-27T00:00:00.000Z");
+      session.runState.toolCalls = values.map((result, index) => ({
+        id: `call-${index}`, name: "lookup", arguments: {}, status: "completed", result,
+      }));
+      await fixture.store.save(session);
+      const reopened = await fixture.reopen();
+      assert.deepEqual((await reopened.get(session.id))?.runState?.toolCalls.map((call) => call.result), values);
+    });
+  });
+
   test(`${adapter.name} SessionStore: create, get, getOrCreate, and duplicate create`, async () => {
     await withFixture(adapter, async ({ store }) => {
       assert.equal(await store.get("missing"), undefined);
