@@ -1,7 +1,7 @@
 {
-  "name": "42-agent",
+  "name": "wayline-agent-runtime",
   "version": "0.1.0",
-  "description": "Protocol-neutral single-process runtime for production AI agents",
+  "description": "Embeddable TypeScript runtime for durable, tool-using AI agents",
   "license": "Apache-2.0",
   "keywords": [
     "ai",
@@ -93,12 +93,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/42-club/42-agent.git"
+    "url": "git+https://github.com/singlebase-us/wayline-agent-runtime.git"
   },
   "bugs": {
-    "url": "https://github.com/42-club/42-agent/issues"
+    "url": "https://github.com/singlebase-us/wayline-agent-runtime/issues"
   },
-  "homepage": "https://github.com/42-club/42-agent#readme",
+  "homepage": "https://github.com/singlebase-us/wayline-agent-runtime#readme",
   "publishConfig": {
     "access": "public"
   }

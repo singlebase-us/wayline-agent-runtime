@@ -1,4 +1,4 @@
-# 42 Agent Architecture
+# Wayline Agent Runtime Architecture
 
 `AgentRuntime` is the protocol-neutral host boundary. All protocol/channel turns pass through it for
 session lifecycle, capability selection, cancellation, and close admission. It derives the canonical
@@ -224,7 +224,7 @@ publishes the corresponding event. This preserves one mutation-admission path an
 of observer-visible terminal outcomes. For tool batches it creates a private per-Run `RunMutationGate` that
 couples each admitted mutation to a serialized checkpoint. The internal coordinated executor receives this
 narrow gate instead of `SessionStore`; policy objects never receive either one. The deprecated
-`ToolExecutor` is available only through the explicit `42-agent/legacy` compatibility entry point. It is
+`ToolExecutor` is available only through the explicit `wayline-agent-runtime/legacy` compatibility entry point. It is
 not exported by the package root or the `runtime/` barrel and is not part of the Loop's mutation path.
 Trusted write tools may still access the live Session only within their exclusive Loop-authorized barrier.
 

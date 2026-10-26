@@ -1,472 +1,266 @@
-# 42 Agent
+# Wayline Agent Runtime
 
-[中文文档](./README.zh-CN.md)
+[中文](./README.zh-CN.md) · [Architecture](./ARCHITECTURE.md) · [Examples](./examples) · [Contributing contract](./AGENT.md)
 
-42 Agent is a small, embeddable TypeScript runtime for durable, tool-using AI agents. It is intended
-to be the execution substrate beneath production applications, not the application-level agent
-orchestrator itself.
+An embeddable TypeScript runtime for agents that use tools and keep durable conversation state.
+Wayline runs the model/tool loop, checkpoints progress, and exposes a common lifecycle through ACP,
+HTTP, or your own application. Your application supplies the model, capabilities, and deployment policy.
 
-## Project responsibility
+## What it provides
 
-One 42 Agent runtime hosts one independent agent process. It owns the execution and durable state of
-the sessions assigned to that process:
+- **Session lifecycle:** create sessions, send prompts, stream progress, steer active runs, cancel work,
+  and close cleanly through `AgentRuntime`.
+- **Durable execution:** persist messages, run state, and tool-call outcomes with in-memory, file,
+  SQLite, or PostgreSQL stores. The Supabase profile uses the PostgreSQL engine.
+- **Controlled concurrency:** FIFO turns within each session, concurrent independent sessions, and
+  bounded parallel tools with exclusive barriers for ordered operations.
+- **Integrations:** an official-SDK ACP v1 adapter, an HTTP development adapter and CLI, OpenRouter
+  and AI SDK provider adapters, local tools, MCP tools, and file-backed skills.
+- **Conservative recovery:** checkpoint at model/tool boundaries and reconcile interrupted work
+  without automatically replaying tools whose external outcome is unknown.
 
-- run the model/tool loop and expose structured progress events
-- persist canonical messages, run state, and tool-call checkpoints
-- enforce FIFO turn ordering within one session while allowing independent sessions to run concurrently
-- normalize model providers, tools, skills, and frontend channels behind stable internal interfaces
-- cooperatively cancel active work, join every started tool, and recover conservatively after interruption
-
-The runtime is deliberately a single-process building block. A production application may launch many
-42 Agent processes and run them in parallel. Those agents remain independent: they do not share an
-in-memory queue, do not coordinate through a common `SessionStore`, and do not require distributed locks.
-Give every process its own File/SQLite Store. Several processes may use one physical PostgreSQL database
-only when the application keeps ownership disjoint; at most one process may own a given
-`(namespace, session ID)` at a time.
-
-The application above the runtime is responsible for agent discovery, task decomposition, scheduling,
-result routing, collaboration policy, identity, tenancy, and deployment. If agent A's output becomes agent
-B's input, that relationship is created by the application-level orchestrator rather than hidden inside
-either agent runtime.
+One process owns one independent agent runtime. Applications can coordinate multiple processes, but
+agent discovery, task delegation, scheduling, authentication, tenancy, and UI belong to the host.
 
 ```text
-production application / orchestrator
-              │
-              ├── ACP client ──► 42 Agent process A ──► SessionStore A
-              ├── ACP client ──► 42 Agent process B ──► SessionStore B
-              └── ACP client ──► 42 Agent process C ──► SessionStore C
+Your application / orchestrator
+           │
+           ├── ACP client ──► Wayline process A ──► Store A
+           └── ACP client ──► Wayline process B ──► Store B
+
+Inside each process:
+ACP / HTTP / custom adapter
+           │
+      AgentRuntime
+           │
+       AgentLoop ──► Model provider
+           ├───────► ToolRegistry / MCP / Skills
+           └───────► SessionStore
 ```
 
-## Protocol direction
+## Quick start
 
-[Agent Client Protocol (ACP)](https://agentclientprotocol.com/) is the standard boundary between an
-application-level orchestrator and each 42 Agent process. The bundled adapter uses the official
-`@agentclientprotocol/sdk` and implements stable ACP v1 over `AgentRuntime`; ACP-specific lifecycle and
-wire types remain outside the core execution model. An orchestrator can act as the ACP client of several
-independent agents and coordinate them concurrently.
+Requires **Node.js 22.13.0 or newer** and npm.
 
-ACP is a client-to-agent protocol in this architecture. It does not make the runtimes share state and is
-not itself the collaboration policy: the orchestrator composes independent ACP connections into a
-multi-agent system.
+```bash
+git clone https://github.com/singlebase-us/wayline-agent-runtime.git
+cd wayline-agent-runtime
+npm ci
+npm run example
+```
 
-### ACP adapter
+The example uses an in-memory store and a local echo model. It needs no API key and prints `收到：你好`.
 
-`createAcpAgent` exposes initialization, session new/resume/delete, prompt, cancellation, ordered text and
-tool updates, and optional client-side permission requests. Prompt cancellation is forwarded from both
-the request and `session/cancel`. Update delivery is ordered and bounded by `maxPendingUpdates` and
-`updateDeliveryTimeoutMs`; a stalled client cancels the prompt rather than growing an unbounded queue.
-Text and baseline `resource_link` prompt blocks are accepted, with resource links converted to explicit
-text markers. `name`, `title`, and `version` configure the identity returned by initialization.
+### Embed the runtime
 
-The required `workspaceRoot` is the canonical root already enforced by the host's tools or sandbox. ACP
-session `cwd` must resolve to that same directory; this adapter does not dynamically reconfigure tool
-roots. New ACP Sessions receive a protected Runtime binding to that root; generic Session metadata cannot
-set or replace it. Resume, prompt, cancel, and delete atomically require the same binding, so a forged
-metadata key or a delete/recreate race cannot cross adapter ownership. Missing or foreign bindings are
-rejected without exposing whether an existing Session is foreign. Resume and prompt reject a nonexistent
-Session, while delete remains idempotent. `session/cancel` affects only a prompt admitted by this adapter.
+After `npm run build`, save this as `demo.mjs` in the repository root and run `node demo.mjs`.
+The package name below resolves through the repository's own package exports.
 
-The binding is an exact versioned envelope (`{ version: 1, kind, value }`) persisted through a
-Store-protected top-level field (and an independent column in database Stores). The trust boundary is that
-protected Store capability and write path, not the JSON shape: every `runtime.binding` value in generic
-metadata is quarantined rather than promoted. Sessions created by the previous ACP adapter carry only
-`acp.cwd`; that key was also generic metadata and is insufficient proof of ownership. Both legacy forms are
-hidden from unbound channels as missing Sessions, and current generic metadata strips both reserved keys.
-The File Store likewise ignores `ownership` found in an older raw Session JSON file; only its new
-magic-framed container carries protected provenance.
-Custom Session Stores must explicitly implement the protected atomic create/claim contract before Runtime
-bindings can be used. To retain a known pre-upgrade ACP Session, supply
-`authorizeLegacySessionMigration` with a trusted Session-ID allowlist or equivalent external inventory.
-Approval must not be based only on the stored `acp.cwd` or requested workspace. After approval, the Runtime
-re-checks the exact marker inside the per-Session FIFO, removes it, and performs one versioned save. An
-outcome-unknown save is returned to the host without retry; reload the Session to learn whether the binding
-became durable. The callback receives an `AbortSignal`; delete and disconnect cancel and join pending
-authorization, while delete blocks new resume/prompt admission for that Session.
+```js
+import {
+  AgentLoop,
+  AgentRuntime,
+  InMemorySessionStore,
+  ToolRegistry,
+} from "wayline-agent-runtime";
 
-To bridge Runtime approvals to the active ACP client, use the same `AcpPermissionBridge` when
-constructing both `AgentLoop` and the adapter. The snippet assumes `model`, `tools`, and `sessionStore`
-have been configured as in [`examples/minimal.ts`](./examples/minimal.ts):
-
-```ts
-import { Readable, Writable } from "node:stream";
-import { ndJsonStream } from "@agentclientprotocol/sdk";
-import { AgentLoop, AgentRuntime } from "42-agent";
-import { AcpPermissionBridge, createAcpAgent } from "42-agent/acp";
-
-const permissions = new AcpPermissionBridge();
-const loop = new AgentLoop({
-  model,
-  tools,
-  sessionStore,
-  requestApproval: permissions.requestApproval,
+const runtime = new AgentRuntime({
+  loop: new AgentLoop({
+    model: {
+      async complete({ messages }) {
+        return { content: `Echo: ${messages.at(-1)?.content ?? ""}` };
+      },
+    },
+    tools: new ToolRegistry(),
+    sessionStore: new InMemorySessionStore(),
+    requestApproval: async () => false,
+  }),
 });
-const runtime = new AgentRuntime({ loop });
 
-const app = createAcpAgent(runtime, {
-  workspaceRoot: process.cwd(), // Must match the host tool/sandbox root.
-  permissionBridge: permissions,
-});
-const connection = app.connect(ndJsonStream(
-  Writable.toWeb(process.stdout),
-  Readable.toWeb(process.stdin),
-));
 try {
-  await connection.closed;
+  await runtime.createSession({ sessionId: "demo" });
+  const result = await runtime.prompt({
+    sessionId: "demo",
+    content: [{ type: "text", text: "Hello, Wayline." }],
+  });
+  console.log(result.content.map((part) => part.text).join(""));
 } finally {
   await runtime.close();
 }
 ```
 
-The embedding host owns the ACP transport; the example uses the official SDK's NDJSON stdio stream. The
-adapter enforces one live ACP client connection per `AgentApp` instance.
-Outside an active ACP prompt, `AcpPermissionBridge` denies by default unless the host supplies an explicit
-fallback policy. `ToolRegistry` binds the canonical Turn signal to approval calls, so Runtime shutdown can
-cancel a pending ACP permission request even when a Tool only awaits `requestApproval`.
-The adapter deliberately reports `loadSession: false` and does not implement session replay/load,
-`session/close`, additional workspace directories, ACP-managed MCP server lifecycles, or
-image/audio/embedded-resource prompt blocks. Non-empty `mcpServers` and `additionalDirectories` are
-rejected instead of being silently ignored. ACP v1 has no message-replacement primitive, so if a final
-canonical response diverges from emitted deltas, it is published under a new message ID.
+For another local project, run `npm pack` in this checkout, then install the generated tarball in that
+project. These instructions use the repository build and do not depend on a published npm release.
 
-## Non-goals
+### Run with a real model
 
-42 Agent does not own:
+The HTTP example uses OpenRouter and defaults to a local SQLite database.
 
-- a distributed scheduler or cluster membership system
-- shared mutable sessions across runtime processes
-- cross-agent locking, consensus, or a global conversation history
-- application-specific delegation, planning, or collaboration policy
-- end-user authentication, tenant routing, billing, or product UI
-- exactly-once execution of tools with external side effects
+```bash
+cp .env.example .env
+# Set OPENROUTER_API_KEY in .env; optionally change the model IDs.
+npm run build
+node --env-file=.env dist/examples/runtime-server.js
+```
 
-The central design rule is that **the core Runtime does not bind sessions to channels**. A concrete
-adapter may still impose admission and ownership policy before resolving an event to a Session ID. HTTP,
-web, CLI, and bot integrations are examples of channels; none reconstructs conversation history. The ACP
-adapter operates only on ACP-bound Sessions in its configured workspace, so cross-channel continuation
-requires an explicit trusted migration rather than possession of a Session ID alone.
+The example reads process environment variables; `.env` is loaded by the explicit `--env-file` flag.
+If variables are already exported in your shell, `npm run runtime` also builds and starts the server.
+
+From another terminal:
+
+```bash
+node dist/src/channel/cli/main.js --session demo
+```
+
+Or send a request directly:
+
+```bash
+curl -N http://127.0.0.1:8787/v1/turn \
+  -H 'Content-Type: application/json' \
+  -d '{"sessionId":"demo","userInput":"Hello, Wayline."}'
+```
+
+`POST /v1/turn` creates a missing session and streams newline-delimited JSON events followed by a
+result or error. Reusing the session ID continues its stored conversation. `GET /health` returns
+`{"ok":true}`. The CLI accepts `--url` and `--session`; enter `/exit` to leave it.
+
+The HTTP adapter is intended for trusted development use: it binds to loopback by default and has no
+authentication. Public deployments need host-owned authentication, tenant routing, Host validation,
+and rate limits. The example registers conversation compression, but does not register shell execution.
+
+## Configure persistence
+
+The HTTP example accepts these environment variables:
+
+| Variable | Purpose / default |
+| --- | --- |
+| `OPENROUTER_API_KEY` | Required for the real-model example |
+| `OPENROUTER_MODEL` | Main model; default `anthropic/claude-opus-4.6` |
+| `OPENROUTER_SUMMARY_MODEL` | Compression model; default `openai/gpt-4.1-mini` |
+| `AGENT_RUNTIME_HOST` / `AGENT_RUNTIME_PORT` | Listen address; default `127.0.0.1:8787` |
+| `AGENT_DATABASE_MODE` | `auto`, `postgres`, `supabase`, or `sqlite`; default `auto` |
+| `AGENT_DATABASE_NAMESPACE` | PostgreSQL session namespace; default `runtime-server` |
+| `AGENT_SQLITE_PATH` | SQLite file; default `.agent-data/runtime.sqlite` |
+| `AGENT_POSTGRES_URL` | PostgreSQL runtime connection string |
+| `SUPABASE_DATABASE_URL` | Supabase PostgreSQL database connection string |
+| `AGENT_DATABASE_SCHEMA_MODE` | Remote schema handling: `check` (default) or explicit `migrate` |
+| `AGENT_POSTGRES_MIGRATION_URL` / `SUPABASE_MIGRATION_URL` | Optional separate migration connection |
+
+In `auto` mode, the selection order is **PostgreSQL → Supabase → SQLite**. All declared profiles must
+be valid. A connection failure stops startup; it does not silently switch stores. Selecting a different
+backend does not migrate existing data.
+
+For an embedded application, open the store explicitly:
+
+```js
+import { openSessionStore } from "wayline-agent-runtime/storage";
+
+const sessionStore = await openSessionStore({
+  namespace: "my-agent",
+  sqlite: { filename: ".agent-data/my-agent.sqlite" },
+});
+// Pass sessionStore to AgentLoop.
+// During shutdown, await runtime.close() before await sessionStore.close().
+```
+
+PostgreSQL-backed stores use the private `agent_runtime` schema. Startup checks schema readiness by
+default; apply migrations explicitly with `migratePostgresSchema` or a deliberate `schemaMode: "migrate"`
+setup step. Separate migration and runtime roles require explicit runtime-role grants.
+
+The Supabase profile takes a PostgreSQL database URL, not a Data API URL or API key. It defaults to TLS
+unless the connection URL configures TLS itself. See [storage architecture](./ARCHITECTURE.md) for
+migration, permissions, TLS, and lifecycle details.
+
+Each process needs its own file or SQLite store. Multiple processes may use one PostgreSQL database
+only with disjoint ownership: **at most one process may own a `(namespace, session ID)` pair**.
+Version checks do not provide distributed scheduling or cross-process locking for tool effects.
+
+## Public API and adapters
+
+| Import | Contents |
+| --- | --- |
+| `wayline-agent-runtime` | `AgentRuntime`, `AgentLoop`, model/session contracts, skills, `ToolRegistry` |
+| `wayline-agent-runtime/acp` | `createAcpAgent`, `AcpPermissionBridge` |
+| `wayline-agent-runtime/channel` | Channel runtime, HTTP server/client, channel contracts |
+| `wayline-agent-runtime/provider` | OpenRouter and AI SDK provider adapters |
+| `wayline-agent-runtime/storage` | File, SQLite, PostgreSQL stores, configuration and migrations |
+| `wayline-agent-runtime/tools` | Tool contracts, optional Bash and conversation compression |
+| `wayline-agent-runtime/mcp` | MCP tool adaptation, refresh, and lifecycle |
+| `wayline-agent-runtime/legacy` | Deprecated `ToolExecutor` compatibility API |
+
+### ACP: clients control the agent
+
+The adapter uses `@agentclientprotocol/sdk` for stable ACP v1. It supports initialization,
+session creation/resume/deletion, prompts, cancellation, ordered text/tool updates, and optional
+client-side permission requests. The embedding host supplies the transport and closes the runtime.
+
+`workspaceRoot` must match the root enforced by the host's tools or sandbox. ACP sessions carry a
+protected workspace binding; knowing a session ID does not authorize another adapter to use it.
+Use the same `AcpPermissionBridge` instance in the loop and ACP adapter when forwarding approvals.
+
+The adapter reports `loadSession: false`. Replay/load, `session/close`, additional workspace
+directories, ACP-managed MCP server lifecycles, and image/audio/embedded-resource prompts are not
+implemented. Text and baseline resource links are accepted. Full contracts are in
+[ARCHITECTURE.md](./ARCHITECTURE.md).
+
+### Tools, MCP, and skills
+
+Register implementations in the host, then select capability names at runtime, session, or turn scope.
+Prompts cannot install executable tools. Skills supply instructions; MCP supplies tools; ACP exposes
+the agent to its client.
+
+Read-only tools receive immutable session snapshots. Trusted session-writing tools execute exclusively.
+Tools with ordered external side effects should also use `executionPolicy: "exclusive"`.
+MCP tools require approval and run exclusively by default; trusting server annotations is a host opt-in.
+The optional `BashTool` requires approval for every command and is not an OS sandbox.
+
+## Execution guarantees
+
+- Turns and explicit recovery share one FIFO per session within a process; different sessions can run
+  concurrently.
+- Tool outcomes are checkpointed before the next model step. Recovery does not automatically repeat a
+  tool left with an unknown external outcome. External effects are not guaranteed exactly once.
+- Cancellation is cooperative. Shutdown stops new admissions and waits for started work; tools and
+  providers must observe their `AbortSignal` for prompt shutdown.
+- Session saves are version-checked updates. A stale save cannot recreate a deleted session. An
+  outcome-unknown save requires reloading state before reconciliation.
+- Progress events are immutable, best-effort projections. Observers cannot change canonical state or
+  block execution; transport adapters own ordered delivery and backpressure.
+- The host owns managed store resources and closes them after the runtime drains its work.
+
+## Development
+
+```bash
+npm run check       # Lint, type-check, tests, and coverage gates
+npm pack --dry-run  # Build and inspect the distributable package
+```
+
+Use `npm test` for tests without coverage, or `npm run lint` and `npm run typecheck` independently.
+Coverage gates are 85% lines/statements, 75% branches, and 80% functions. CI covers Node.js 22.13,
+24, and 26, plus PostgreSQL 15 and 17. Local PostgreSQL contract tests require `TEST_POSTGRES_URL`;
+without it, those database tests are skipped.
 
 ```text
-channel A ─┐
-channel B ─┼─► AgentRuntime ─► AgentLoop ─► Model / Tools ─► SessionStore
-channel C ─┘
+src/agent-runtime.ts   Session lifecycle and capability selection
+src/agent-loop.ts      Model/tool loop and mutation coordination
+src/runtime/           Execution, retry, recovery, steering, events
+src/acp/               ACP adapter and permissions
+src/channel/           HTTP, CLI, and channel adapters
+src/provider/          Model provider integrations
+src/storage/           Store selection, migrations, and database lifecycle
+src/tools/             Local capabilities
+src/mcp.ts             MCP tool adapter
+src/session*.ts        Session contracts and local stores
+examples/              Minimal and HTTP examples
+tests/                 Unit, integration, and protocol tests
 ```
 
-## Current capabilities
+Read [AGENT.md](./AGENT.md) before changing execution or ownership semantics, and keep
+[ARCHITECTURE.md](./ARCHITECTURE.md) aligned with changes to runtime guarantees.
 
-- official stable ACP v1 adapter with honest capability negotiation, bounded updates, cancellation, and permission bridging
-- protocol-neutral `AgentRuntime` lifecycle for sessions, prompts, cancellation, steering, and capabilities
-- one canonical `SessionStore`, `ToolRegistry`, and Skill loader, derived from `AgentLoop` and checked at Runtime construction
-- runtime, session, and turn-level Tool/Skill selection without injecting implementations through prompts
-- protected protocol bindings plus immutable per-Turn Tool and Skill snapshots
-- runtime-isolated, deeply immutable Session snapshots for read-only tools
-- bounded parallel execution for explicitly parallel tools and exclusive execution for ordered side effects or trusted write tools
-- canonical server-side messages and run state, isolated from Model, Tool-argument, event, and Runtime DTO snapshots
-- detached, immutable, non-blocking progress events that cannot rewrite or stall canonical execution outcomes
-- streaming model events and cooperative cancellation propagated to providers and MCP tools
-- local and MCP-compatible tools
-- steering at model/tool barriers
-- durable checkpoints at model and tool boundaries
-- conservative crash reconciliation: uncertain side effects are never replayed automatically
-- update-only, version-checked in-memory, file, SQLite, and PostgreSQL session stores; Supabase reuses the
-  PostgreSQL engine
-- managed database startup selection with PostgreSQL > Supabase > SQLite priority and no failure fallback
-- pure model-request, recovery, and finalization policy plans applied and checkpointed only by `AgentLoop`
-- per-session FIFO turns and recovery while different sessions remain concurrent
-- non-empty, NUL-free, well-formed Unicode Session IDs with collision-checked, fixed-length File Store paths
+## Origin and license
 
-## Architecture
-
-`AgentRuntime` is the only protocol-facing lifecycle facade. It derives the Store, Tool registry, and Skill
-loader from `AgentLoop`, so validation, execution, close, and recovery cannot be wired to different sources
-of truth.
-`AgentLoop` owns the per-session FIFO coordinator and remains the only core mutation coordinator.
-`ModelRequestPlanner`, `RunRecovery`, and `RunFinalizer` only return plans; the Loop applies them, saves the
-result, and orders events. Its internal coordinated Tool executor receives only a private per-Run mutation
-gate, which serializes admitted mutations with their checkpoints. The deprecated `ToolExecutor` retains
-its old direct-construction API only from `42-agent/legacy`; it is not used by `AgentLoop` and is not part
-of the stable core surface.
-`SessionStore` is the persistence boundary.
-Channels normalize transport input and project best-effort events; providers normalize model APIs; tools
-execute capabilities. See
-[ARCHITECTURE.md](./ARCHITECTURE.md) for boundaries, storage selection, and recovery semantics.
-
-## Quick start
-
-Requires Node.js 22.13 or newer. Node.js 24 LTS is recommended.
-
-```bash
-npm install
-npm test
-npm run example
-```
-
-Engineering checks are available separately or as one local gate:
-
-```bash
-npm run lint
-npm run typecheck
-npm run coverage
-npm run check
-```
-
-`npm run coverage` runs the test suite and enforces at least 85% lines/statements, 75% branches, and 80%
-functions across `dist/src`. GitHub Actions runs lint, type-checking, coverage gates, and
-`npm pack --dry-run` on Node.js 22.13, 24, and 26.
-
-The package root exports only the protocol-neutral core: `AgentLoop`, `AgentRuntime`, canonical model and
-Session contracts, Skills, and `ToolRegistry`. Integrations use explicit public subpaths:
-
-- `42-agent/acp`: ACP adapter
-- `42-agent/channel`: Channel Runtime, HTTP server/client, and Channel contracts
-- `42-agent/provider`: Provider adapters, including OpenRouter and AI SDK adapters
-- `42-agent/storage`: File, SQLite, PostgreSQL/Supabase, and managed Store lifecycle
-- `42-agent/tools`: Tool contracts, Bash, and conversation compression
-- `42-agent/mcp`: MCP tool adaptation and lifecycle
-- `42-agent/legacy`: deprecated `ToolExecutor` compatibility API only
-
-Importing `42-agent` no longer evaluates ACP, provider, Channel, PostgreSQL, or other optional adapter
-barrels. Imports of those symbols from the package root, including `ToolExecutor`, are breaking changes;
-move them to the corresponding subpath. Internal `src/runtime/*` policy objects are not package exports.
-This release also removes the no-op `AgentRuntime.start()` method: use a constructed Runtime immediately.
-`RuntimeStopReason` is now only `"end_turn"`; cancellation and failure reject `prompt()` and must be handled
-as errors (ACP maps cancellation to its own protocol stop reason). Finally, `SessionInfo.skills` and
-`SessionInfo.tools` are now the explicit `CapabilityScope` union—branch on `mode` before reading `names`
-instead of treating either field as an array.
-It is licensed under [Apache-2.0](./LICENSE) and configured for public npm publication. Public releases
-use semantic versions and remain an explicit maintainer action; `npm pack --dry-run` verifies package
-contents without publishing them.
-
-## Managed database storage
-
-`openSessionStore` accepts PostgreSQL, Supabase, and SQLite configuration profiles backed by two physical
-engines. In the default `auto` mode it selects PostgreSQL first, then Supabase, then SQLite:
-
-```ts
-import { resolve } from "node:path";
-import {
-  migratePostgresSchema,
-  openSessionStore,
-  resolveSessionDatabaseConfig,
-  type SessionDatabaseConfig,
-} from "42-agent/storage";
-
-const storageConfig: SessionDatabaseConfig = {
-  namespace: "orders-agent",
-  ...(process.env.AGENT_POSTGRES_URL
-    ? { postgres: { connectionString: process.env.AGENT_POSTGRES_URL } }
-    : {}),
-  ...(process.env.SUPABASE_DATABASE_URL
-    ? {
-        supabase: {
-          databaseUrl: process.env.SUPABASE_DATABASE_URL,
-          // Use only for an intentionally plaintext local/self-hosted database.
-          ...(process.env.SUPABASE_DATABASE_SSL === "false" ? { ssl: false } : {}),
-        },
-      }
-    : {}),
-  sqlite: { filename: resolve(".agent-data/runtime.sqlite") },
-};
-
-// Safe to log: credentials are deliberately omitted.
-console.log(resolveSessionDatabaseConfig(storageConfig));
-const sessionStore = await openSessionStore(storageConfig);
-```
-
-Every declared profile is validated before selection, so a partial profile is a configuration error. Once
-selected, connection or readiness failure fails startup; it never falls through to another profile, and
-the Runtime never switches its canonical Store. Explicit `mode: "postgres" | "supabase" | "sqlite"`
-selects only that profile. Adding a remote profile does not migrate existing SQLite data.
-
-Supabase uses its PostgreSQL `databaseUrl`, not `supabase-js`, a Data API key, or the REST/GraphQL API. For
-this persistent Node runtime, use a [direct database connection or the session pooler when IPv4 requires
-it](https://supabase.com/docs/guides/database/connecting-to-postgres). PostgreSQL and Supabase data live in
-the private `agent_runtime` schema and are keyed by `(namespace, session ID)`; the application must ensure
-that no two processes own the same pair concurrently.
-
-For each Supabase `databaseUrl` and `migrationUrl`, TLS defaults to `ssl: true` unless that URL contains an
-option that actually configures SSL (`ssl`, `sslmode`, `sslcert`, `sslkey`, `sslrootcert`, or
-`sslnegotiation=direct`). `sslnegotiation=postgres` changes only the handshake, so by itself it retains the
-secure profile default. Empty, repeated, or unknown negotiation parameters are rejected rather than being
-allowed to suppress TLS accidentally. When the URL configures SSL, the library leaves its effective value
-to `pg`; an explicit profile-level `ssl` setting cannot be combined with those URL options. Set `ssl: false`
-only for an intentionally plaintext local or self-hosted database; never disable TLS for hosted Supabase.
-The safe resolution diagnostic includes `ssl` when the library selected it and omits the field when the URL
-controls TLS.
-
-PostgreSQL-backed startup defaults to `schemaMode: "check"`. Apply DDL explicitly in a deployment step
-with `migratePostgresSchema(...)`, or opt a profile into `schemaMode: "migrate"`; an optional
-`migrationConnectionString`/`migrationUrl` can keep elevated migration credentials separate from runtime
-credentials. Put that explicit invocation in the deployment pipeline; Supabase documents its [database
-migration workflow](https://supabase.com/docs/guides/deployment/database-migrations). `openSessionStore`
-performs its readiness check before returning, including migration integrity and every documented runtime
-schema/table privilege.
-
-The standalone migration API is profile-aware, so Supabase retains the same secure TLS default:
-
-```ts
-await migratePostgresSchema({
-  profile: "supabase",
-  databaseUrl: process.env.SUPABASE_MIGRATION_URL
-    ?? process.env.SUPABASE_DATABASE_URL!,
-});
-
-// A regular PostgreSQL deployment uses the connection string's TLS policy.
-await migratePostgresSchema({
-  profile: "postgres",
-  connectionString: process.env.POSTGRES_MIGRATION_URL!,
-});
-```
-
-If migration and runtime connections use different database roles, the deployment must also grant the
-runtime role access to the private schema and data tables; the library does not infer or create that role.
-For example, run the following as the schema owner after migrations, replacing `agent_runtime_user` with
-the runtime role (and repeat grants when a later migration adds tables):
-
-```sql
-GRANT USAGE ON SCHEMA agent_runtime TO agent_runtime_user;
-GRANT SELECT ON agent_runtime.schema_migrations TO agent_runtime_user;
-GRANT SELECT, INSERT, UPDATE, DELETE
-  ON agent_runtime.sessions, agent_runtime.messages,
-     agent_runtime.runs, agent_runtime.tool_calls
-  TO agent_runtime_user;
-```
-
-The embedding host owns the managed Store. Close the Runtime first so admitted work finishes, then release
-the Store's database resources:
-
-```ts
-await server.close();       // Stop request admission.
-await runtime.close();      // Drain admitted work.
-await sessionStore.close(); // Release the pool/database.
-```
-
-To run the OpenRouter-backed HTTP runtime:
-
-```bash
-export OPENROUTER_API_KEY=...
-# Optional. PostgreSQL wins if both remote URLs are set.
-export AGENT_POSTGRES_URL=postgresql://...
-# Or: export SUPABASE_DATABASE_URL=postgresql://...
-# For an explicit first migration: export AGENT_DATABASE_SCHEMA_MODE=migrate
-npm run runtime
-```
-
-With neither remote URL set, the example uses the configured SQLite file. Its complete environment mapping
-and signal-safe shutdown order are in [`examples/runtime-server.ts`](./examples/runtime-server.ts).
-
-The HTTP server is a trusted development adapter, not a production ingress: it has no authentication,
-binds to loopback by default, rejects browser origins unless an exact `allowedOrigin` is configured,
-requires JSON request bodies, bounds request and queued event bytes, and does not register the optional
-Bash tool. It returns typed 4xx admission failures, keeps internal failures generic, and redacts internal
-error messages/codes from streamed events. Put authentication, Host/DNS-rebinding defense, tenancy, rate
-limits, and deployment policy in the embedding application.
-
-Then use the CLI with an explicit session ID:
-
-```bash
-npm run cli -- --session shared-session
-```
-
-Another channel that resolves to `shared-session` will continue the same canonical session.
-
-## Runtime guarantees
-
-- Within one runtime process, turns for one session execute in FIFO order; the slot is reserved before
-  asynchronous Session/Skill preflight, while different sessions may execute concurrently.
-- Explicit recovery uses the same per-session FIFO and cannot race an active turn.
-- A request cancelled before its FIFO admission does not create a Run or append a user message.
-- Steering and cancellation admission close at the Turn's terminal barrier; control messages cannot leak
-  into the next Turn.
-- Separate runtime processes are independent and may execute concurrently. They must not concurrently own
-  the same namespaced Session even when their Stores use one physical PostgreSQL database.
-- Cancellation stops new tool dispatch and does not settle until every already-started tool has settled.
-- Repeated or re-entrant Runtime/Session close calls join the same shutdown operation; close gates new work,
-  waits for admitted reads, recovery, Turns, and tools, then deletes Session state where requested.
-- Completed tool results are persisted before the next model step.
-- Recovery materializes every durable completed/failed tool outcome as a model-visible tool message.
-- A tool left in `running` state after a crash is treated as having an unknown outcome and is not replayed.
-- Store `save` operations update an existing version only; a late save cannot recreate a deleted session.
-  Existing message prefixes are append-only unless `rewriteMessages` is explicit.
-- A Store that cannot determine whether a save committed throws `SessionSaveOutcomeUnknownError`; the Loop
-  does not attempt another save from the stale Session, and the host must reload before reconciliation.
-- Event observers receive detached frozen values; exceptions, mutation attempts, and unresolved callbacks
-  are isolated from canonical run and tool status. Adapters own ordered delivery and backpressure.
-- The runtime does not claim exactly-once execution for external side effects.
-
-## Tool trust and cancellation
-
-Session-read-only tools receive a detached, deeply frozen Session snapshot. A tool registered with
-`sessionAccess: "write"` is a trusted Runtime extension: it receives the live Session and runs as an
-exclusive barrier relative to the rest of its tool batch. Tool results must be JSON-serializable; invalid
-results become model-visible tool failures instead of corrupting persistence. Its checkpoint rewrites the
-complete message history so mutations are durable consistently across Store implementations. Because this
-is host-trusted code, it can intentionally change Session metadata, including Runtime-reserved capability
-fields; subsequent queued authorization runs in FIFO order and observes the persisted change. It cannot
-replace Store-protected ownership through a normal checkpoint: an attempted change fails the save instead
-of changing adapter ownership.
-
-`sessionAccess` says nothing about external side effects. Tools that must preserve external ordering use
-`executionPolicy: "exclusive"`; only tools safe to overlap and reorder should use the default parallel
-policy. Bash is exclusive. Tool-call arguments are detached before execution, and Model clients receive
-frozen message/definition snapshots.
-
-MCP annotations are untrusted hints by specification. Consequently, MCP tools require approval and run
-exclusively by default, even when a server claims `readOnlyHint: true`. A host that trusts a configured
-server may opt in with `trustToolAnnotations: true`; only then does an explicitly read-only tool skip
-approval and default to parallel execution. Wire-provided `executionPolicy` values are ignored. Host-owned
-ordering overrides belong in the local `executionPolicyFor` option:
-
-```ts
-const provider = new MCPToolProvider(client, {
-  trustToolAnnotations: true, // Only for a server the host explicitly trusts.
-  executionPolicyFor: ({ name }) => name === "ordered_read" ? "exclusive" : undefined,
-});
-
-const tools = await provider.load({ signal });
-await provider.refresh({ signal });
-await provider.close();
-```
-
-An MCP result with `isError: true` becomes a typed `MCPToolCallError` rather than a successful tool result;
-JSON-RPC error envelopes become `MCPProtocolError`. `MCPToolProvider.close()` gates new execution and
-refreshes, drains admitted `listTools`/`callTool` requests, and then closes the client, so an acknowledged
-side effect is not discarded by premature transport shutdown. `loadMCPTools` remains a convenience for a
-single snapshot when the caller owns the client lifecycle.
-
-Cancellation is cooperative. Providers, MCP clients, and tools receive an `AbortSignal`, and the Runtime
-waits for started work to settle. Implementations must observe that signal when prompt shutdown matters.
-The optional `BashTool` requires explicit approval for every command, confines `cwd` by default, and bounds
-captured output, but it is not a sandbox; production hosts should prefer an OS/container sandbox or a
-strict command allowlist.
-
-## Repository layout
-
-```text
-src/agent-runtime.ts    protocol-neutral lifecycle and capability facade
-src/agent-loop.ts       orchestration and session serialization
-src/runtime/            model execution, retry, events, steering, tools
-src/provider/           provider adapters
-src/acp/                official-SDK ACP v1 adapter, permission bridge, update projector
-src/channel/            reusable channel adapters
-src/tools/              local tools
-src/mcp.ts              MCP tool policy, result normalization, refresh and lifecycle
-src/storage/            managed database selection, migrations, and Store lifecycle
-src/legacy/             explicitly isolated deprecated compatibility APIs
-src/session*.ts         session contracts and stores
-examples/               minimal and HTTP runtime examples
-tests/                  runtime and integration tests
-```
-
-## Direction
-
-This repository contains the reusable Runtime, protocol adapters, focused examples, and conformance or
-integration tests. Product applications, deployment-specific UI, authentication, tenancy, and hosting
-stacks belong in the production projects that embed this Runtime.
-
-An application belongs in this repository only when it has a clear Runtime-development responsibility,
-such as a future ACP protocol inspector. A generic chat UI or platform starter is not part of the Runtime.
-
-The stable ACP v1 adapter now establishes the intended client-to-agent boundary. Future protocol work may
-add session replay/load, more prompt content types, or ACP-managed MCP lifecycle only when their ownership
-and recovery policies are explicit. Checkpoint continuation for interrupted runs remains a Runtime
-milestone.
+Wayline Agent Runtime is derived from [42 Agent](https://github.com/42-club/42-agent).
+This repository preserves upstream Git history and the [Apache-2.0 license](./LICENSE).
+The Wayline adaptation updates package identity, repository links, default display names, and documentation.
+Existing storage-format identifiers are retained for compatibility with upstream session data.

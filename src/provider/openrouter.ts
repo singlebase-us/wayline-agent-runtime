@@ -62,7 +62,7 @@ export class OpenRouterModelClient implements ModelClient {
       apiKey: overrides.apiKey ?? process.env.OPENROUTER_API_KEY ?? "",
       model: overrides.model ?? process.env.OPENROUTER_MODEL ?? "anthropic/claude-opus-4.6",
       baseUrl: overrides.baseUrl,
-      appName: overrides.appName ?? process.env.OPENROUTER_APP_NAME ?? "42 Agent",
+      appName: overrides.appName ?? process.env.OPENROUTER_APP_NAME ?? "Wayline Agent Runtime",
       httpReferer: overrides.httpReferer ?? process.env.OPENROUTER_HTTP_REFERER,
       fetch: overrides.fetch,
       contextWindowTokens: overrides.contextWindowTokens,
@@ -145,7 +145,7 @@ export class OpenRouterModelClient implements ModelClient {
     const headers: Record<string, string> = {
       authorization: `Bearer ${this.config.apiKey}`,
       "content-type": "application/json",
-      "x-openrouter-title": this.config.appName ?? "42 Agent",
+      "x-openrouter-title": this.config.appName ?? "Wayline Agent Runtime",
     };
     if (this.config.httpReferer) headers["http-referer"] = this.config.httpReferer;
     return headers;

@@ -75,8 +75,8 @@ export function createAcpAgent(
 ): AgentApp {
   const workspaceRoot = resolveConfiguredWorkspaceRoot(options.workspaceRoot);
   const implementation: Implementation = {
-    name: options.name ?? "42-agent",
-    title: options.title ?? "42 Agent",
+    name: options.name ?? "wayline-agent-runtime",
+    title: options.title ?? "Wayline Agent Runtime",
     version: options.version ?? "0.1.0",
   };
   const maxPendingUpdates = options.maxPendingUpdates ?? DEFAULT_MAX_PENDING_UPDATES;

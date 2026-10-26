@@ -121,7 +121,7 @@ export function createAiSdkOpenRouterClient(config: AiSdkOpenRouterConfig): AiSd
     apiKey: config.apiKey,
     fetch: fetcher,
     headers: {
-      "X-OpenRouter-Title": config.appName ?? "42 Agent",
+      "X-OpenRouter-Title": config.appName ?? "Wayline Agent Runtime",
       ...(config.httpReferer ? { "HTTP-Referer": config.httpReferer } : {}),
     },
   });

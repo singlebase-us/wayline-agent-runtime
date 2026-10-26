@@ -1,11 +1,11 @@
-# 42 Agent Development Contract
+# Wayline Agent Runtime Development Contract
 
 This file records the architectural constraints that contributors and coding agents must preserve.
 `README.md` describes the product boundary; this file turns that boundary into implementation rules.
 
 ## Product model
 
-42 Agent is a single-process execution runtime for one independent agent. It is a reusable substrate for
+Wayline Agent Runtime is a single-process execution runtime for one independent agent. It is a reusable substrate for
 production applications that may start and coordinate many such processes concurrently.
 
 Do not turn this repository into the application-level multi-agent orchestrator. Agent discovery,
